@@ -1,17 +1,17 @@
 #Requires -Version 5.1
 <#
-  Configura questo PC Windows per essere controllato da remoto (da Mac) via:
-    - Tailscale  : VPN mesh (WireGuard), nessuna porta da aprire sul router
-    - TightVNC   : server VNC (Windows Home non ha il server RDP)
-
-  Il server VNC accetta connessioni SOLO dalla rete Tailscale (100.64.0.0/10),
-  sia tramite firewall di Windows sia tramite il filtro IP di TightVNC.
+  Configura questo PC Windows per essere controllato da remoto (da Mac) con AnyDesk
+  in modalita' "accesso non presidiato":
+    - AnyDesk installato come servizio, parte con Windows (anche senza login)
+    - password per l'accesso non presidiato
+    - niente sospensione/ibernazione quando collegato alla corrente
 
   Uso (da PowerShell, si auto-eleva ad amministratore):
-    powershell -ExecutionPolicy Bypass -File .\windows\setup.ps1 [-VncPassword <6-8 caratteri>]
-  Senza -VncPassword la password viene chiesta in modo interattivo.
+    powershell -ExecutionPolicy Bypass -File .\windows\setup.ps1 [-PasswordFile <file>]
+  -PasswordFile: file con la password (viene letto e poi CANCELLATO).
+  Senza -PasswordFile la password viene chiesta in modo interattivo.
 #>
-param([string]$VncPassword)
+param([string]$PasswordFile)
 
 $ErrorActionPreference = 'Stop'
 
@@ -21,7 +21,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Host 'Riavvio come amministratore...'
     $elevArgs = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-    if ($VncPassword) { $elevArgs += @('-VncPassword', $VncPassword) }
+    if ($PasswordFile) { $elevArgs += @('-PasswordFile', "`"$PasswordFile`"") }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $elevArgs
     exit
 }
@@ -29,102 +29,77 @@ if (-not $isAdmin) {
 $logFile = Join-Path $PSScriptRoot 'setup.log'
 Start-Transcript -Path $logFile -Append | Out-Null
 
-$TailscaleCidr = '100.64.0.0/10'
-$VncPort = 5900
-$TailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
-function Test-WingetPackage([string]$Id) {
-    [bool](winget list --id $Id --exact --accept-source-agreements 2>$null | Select-String -SimpleMatch $Id)
-}
-
-function Install-WingetPackage([string]$Id, [string]$Override) {
-    if (Test-WingetPackage $Id) {
-        Write-Host "$Id gia' installato."
-        return
-    }
-    $wingetArgs = @('install', '--id', $Id, '--exact', '--silent',
-        '--accept-package-agreements', '--accept-source-agreements')
-    if ($Override) { $wingetArgs += @('--override', $Override) }
-    & winget @wingetArgs | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Installazione di $Id fallita (exit $LASTEXITCODE)" }
-}
+$InstallDir = Join-Path ${env:ProgramFiles(x86)} 'AnyDesk'
+$AnyDeskExe = Join-Path $InstallDir 'AnyDesk.exe'
 
 try {
-    # --- 1. Tailscale (installazione; il login e' l'ultimo passo) ----------------
-    Write-Host "`n== 1/5 Installazione Tailscale ==" -ForegroundColor Cyan
-    Install-WingetPackage 'Tailscale.Tailscale'
+    # --- 1. Installazione AnyDesk come servizio -----------------------------------
+    Write-Host "`n== 1/3 Installazione AnyDesk ==" -ForegroundColor Cyan
+    # Con l'orologio sfasato anche di un minuto i server AnyDesk rifiutano il
+    # certificato del client (ssl_a000415) e il PC resta "offline" con ID 0.
+    Set-Service w32time -StartupType Automatic
+    Start-Service w32time
+    w32tm /config /manualpeerlist:"time.windows.com,0x9 pool.ntp.org,0x9" /syncfromflags:manual /update | Out-Null
+    w32tm /resync /force | Out-Null
+    Write-Host 'Orologio sincronizzato.'
 
-    # --- 2. TightVNC (server come servizio) ---------------------------------------
-    Write-Host "`n== 2/5 TightVNC server ==" -ForegroundColor Cyan
-    if (Test-WingetPackage 'GlavSoft.TightVNC') {
-        Write-Host "TightVNC gia' installato: per cambiare la password usa 'TightVNC Service - Configuration'."
+    if (Test-Path $AnyDeskExe) {
+        Write-Host "AnyDesk gia' installato."
     } else {
-        $vncPass = $VncPassword
-        while ($vncPass -notmatch '^[^\s"]{6,8}$') {
-            if ($vncPass) { Write-Host 'Password non valida, riprova.' -ForegroundColor Yellow }
-            $sec = Read-Host 'Scegli la password VNC (6-8 caratteri, niente spazi o virgolette)' -AsSecureString
-            $vncPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+        # winget download verifica l'hash; l'installer lo lanciamo noi con i parametri giusti
+        $dl = Join-Path $env:TEMP "anydesk-setup-$(Get-Random)"
+        & winget download --id AnyDesk.AnyDesk --exact --download-directory $dl `
+            --accept-package-agreements --accept-source-agreements | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Download di AnyDesk fallito (exit $LASTEXITCODE)" }
+        $installer = Get-ChildItem $dl -Filter *.exe | Select-Object -First 1
+        $p = Start-Process $installer.FullName -Wait -PassThru -ArgumentList @(
+            '--install', "`"$InstallDir`"", '--start-with-win', '--create-shortcuts',
+            '--create-desktop-icon', '--silent')
+        Remove-Item $dl -Recurse -Force
+        if ($p.ExitCode -ne 0 -or -not (Test-Path $AnyDeskExe)) {
+            throw "Installazione di AnyDesk fallita (exit $($p.ExitCode))"
         }
-
-        # Consenti solo IP Tailscale (0 = allow), nega tutto il resto (1 = deny)
-        $ipAcl = '100.64.0.0-100.127.255.255:0,0.0.0.0-255.255.255.255:1'
-        $msiProps = @(
-            '/quiet', '/norestart',
-            'ADDLOCAL=Server',
-            'SERVER_REGISTER_AS_SERVICE=1',
-            'SERVER_ADD_FIREWALL_EXCEPTION=0',
-            'SERVER_ALLOW_SAS=1',
-            'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
-            'SET_PASSWORD=1', "VALUE_OF_PASSWORD=$vncPass",
-            'SET_USECONTROLAUTHENTICATION=1', 'VALUE_OF_USECONTROLAUTHENTICATION=1',
-            'SET_CONTROLPASSWORD=1', "VALUE_OF_CONTROLPASSWORD=$vncPass",
-            'SET_ACCEPTHTTPCONNECTIONS=1', 'VALUE_OF_ACCEPTHTTPCONNECTIONS=0',
-            'SET_IPACCESSCONTROL=1', "VALUE_OF_IPACCESSCONTROL=$ipAcl"
-        ) -join ' '
-        Install-WingetPackage 'GlavSoft.TightVNC' $msiProps
-        $vncPass = $null
+        # il servizio impiega qualche secondo a registrarsi
+        for ($i = 0; $i -lt 30 -and -not (Get-Service AnyDesk -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
     }
-    Set-Service -Name tvnserver -StartupType Automatic
-    Start-Service -Name tvnserver -ErrorAction SilentlyContinue
-    Write-Host "Servizio tvnserver: $((Get-Service tvnserver).Status)"
+    Set-Service -Name AnyDesk -StartupType Automatic
+    Start-Service -Name AnyDesk -ErrorAction SilentlyContinue
+    Write-Host "Servizio AnyDesk: $((Get-Service AnyDesk).Status)"
 
-    # --- 3. Firewall: VNC raggiungibile solo dalla rete Tailscale ------------------
-    Write-Host "`n== 3/5 Firewall ==" -ForegroundColor Cyan
-    $ruleName = 'VNC via Tailscale'
-    Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort $VncPort -RemoteAddress $TailscaleCidr -Profile Any | Out-Null
-    Write-Host "Regola '$ruleName' creata (TCP $VncPort solo da $TailscaleCidr)."
+    # --- 2. Password per l'accesso non presidiato ---------------------------------
+    Write-Host "`n== 2/3 Accesso non presidiato ==" -ForegroundColor Cyan
+    if ($PasswordFile) {
+        $pass = (Get-Content -Raw $PasswordFile).Trim()
+        Remove-Item $PasswordFile -Force
+    }
+    while ($pass -notmatch '^[A-Za-z0-9]{12,}$') {
+        if ($pass) { Write-Host 'Password non valida, riprova.' -ForegroundColor Yellow }
+        $sec = Read-Host 'Password accesso non presidiato (min 12 caratteri, solo lettere e numeri)' -AsSecureString
+        $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+    }
+    cmd /c "echo $pass| `"$AnyDeskExe`" --set-password" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Impostazione password fallita (exit $LASTEXITCODE)" }
+    $pass = $null
+    Write-Host 'Password impostata.'
 
-    # --- 4. Alimentazione: niente sospensione con alimentatore collegato -----------
-    Write-Host "`n== 4/5 Risparmio energetico ==" -ForegroundColor Cyan
+    # --- 3. Alimentazione: niente sospensione con alimentatore collegato -----------
+    Write-Host "`n== 3/3 Risparmio energetico ==" -ForegroundColor Cyan
     powercfg /change standby-timeout-ac 0
     powercfg /change hibernate-timeout-ac 0
     Write-Host 'Sospensione/ibernazione disattivate quando collegato alla corrente.'
 
-    # --- 5. Login Tailscale --------------------------------------------------------
-    # --unattended: Tailscale resta attivo anche a utente disconnesso / dopo riavvio
-    Write-Host "`n== 5/5 Login Tailscale ==" -ForegroundColor Cyan
-    Write-Host 'Apri il link che compare qui sotto e accedi con il tuo account.'
-    cmd /c "`"$TailscaleExe`" up --unattended 2>&1" | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw 'tailscale up fallito' }
-
     # --- Riepilogo ----------------------------------------------------------------
-    $status = & $TailscaleExe status --json | ConvertFrom-Json
-    $ip = (& $TailscaleExe ip -4 | Select-Object -First 1)
-    $dns = $status.Self.DNSName.TrimEnd('.')
-
+    $id = $null
+    for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+        $id = ((& $AnyDeskExe --get-id | Out-String).Trim()) -replace '\D', ''
+        if (-not $id) { Start-Sleep 2 }
+    }
     Write-Host "`n=========================================" -ForegroundColor Green
     Write-Host ' Configurazione completata'
-    Write-Host "  Nome Tailscale : $($status.Self.HostName)"
-    Write-Host "  MagicDNS       : $dns"
-    Write-Host "  IP Tailscale   : $ip"
-    Write-Host "  Dal Mac        : ./mac/connect.sh $($status.Self.HostName)"
-    Write-Host "                   (oppure: open vnc://${ip}:$VncPort)"
+    Write-Host "  ID AnyDesk : $id"
+    Write-Host "  Dal Mac    : ./mac/connect.sh $id"
     Write-Host '=========================================' -ForegroundColor Green
-    Write-Host 'Consiglio: nella console Tailscale (login.tailscale.com/admin/machines)'
-    Write-Host "disattiva 'Key expiry' per questo PC, altrimenti tra ~6 mesi va rifatto il login."
     Write-Host 'SETUP_DONE'
 } catch {
     Write-Host "ERRORE: $_" -ForegroundColor Red
